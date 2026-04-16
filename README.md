@@ -1,134 +1,116 @@
-# WeChat ↔ BPMSoft OCC Bridge
+# WeCom ↔ BPMSoft OCC Bridge
 
-Middleware-сервис для интеграции WeChat Official Account с BPMSoft OCC через Custom Channel.
+Node.js сервис-маршрутизатор для интеграции **WeCom (企业微信)** с **BPMSoft OCC** (on-premise).  
+Ретранслирует сообщения из чата WeCom в BPMSoft OCC и обратно.
+
+```
+WeCom External Contact  ⇄  WeComRoute  ⇄  BPMSoft OCC Operator
+```
 
 ## Архитектура
 
-```
-┌──────────────┐     XML/HTTP      ┌─────────────────────┐      JSON/HTTP      ┌──────────────────┐
-│              │  ───────────────►  │                     │  ─────────────────►  │                  │
-│  WeChat User │   POST /wechat    │   WeChat-BPMSoft    │   Custom Channel    │  BPMSoft OCC     │
-│  (клиент)    │                   │      Bridge         │   Connector API     │  (оператор CRM)  │
-│              │  ◄───────────────  │   (этот сервис)     │  ◄─────────────────  │                  │
-└──────────────┘   Customer Svc    └─────────────────────┘  POST /bpmsoft/out  └──────────────────┘
-                     API                   │
-                                           │  GET /health
-                                           │  POST /bpmsoft/send (тест)
-```
+### Входящие (WeCom → BPMSoft)
+1. Клиент пишет в WeCom → WeCom вызывает callback `POST /wecom`
+2. Сервис расшифровывает сообщение (`@wecom/crypto`) и парсит XML
+3. Сообщение пересылается в BPMSoft OCC через API коннектора
 
-### Потоки сообщений
+### Исходящие (BPMSoft → WeCom)
+1. Оператор отвечает в BPMSoft → BPMSoft шлёт `POST /Home/InputJSON`
+2. Сервис отправляет сообщение через WeCom API (`qyapi.weixin.qq.com`)
+3. Клиент получает ответ в WeCom
 
-**Входящие (WeChat → BPMSoft):**
-1. Клиент пишет в WeChat Official Account
-2. WeChat отправляет XML на `POST /wechat`
-3. Bridge парсит XML, извлекает OpenID + текст
-4. Bridge отправляет JSON в BPMSoft OCC Connector API (`/services/custom/{channelId}/incoming`)
-5. Оператор видит сообщение в интерфейсе BPMSoft CRM
+---
 
-**Исходящие (BPMSoft → WeChat):**
-1. Оператор отвечает в BPMSoft CRM
-2. BPMSoft OCC Connector отправляет POST на `POST /bpmsoft/outgoing`
-3. Bridge получает JSON с `clientId` (OpenID) и текстом
-4. Bridge отправляет сообщение через WeChat Customer Service API
-5. Клиент получает ответ в WeChat
+## Переменные окружения
+
+| Переменная | Обязательная | Описание | Где взять |
+|---|---|---|---|
+| `WECOM_CORP_ID` | ✅ | ID корпорации (企业ID) | [WeCom Admin](https://work.weixin.qq.com/wework_admin/frame#profile) → Моя организация → Информация об организации → ID корпорации |
+| `WECOM_CORP_SECRET` | ✅ | Секрет приложения (Secret) | WeCom Admin → Управление приложениями → Ваше приложение → Secret (нажать "Просмотр") |
+| `WECOM_TOKEN` | ✅ | Token для верификации callback URL | WeCom Admin → Управление приложениями → Ваше приложение → Получение сообщений (API接收消息) → Token (генерируется автоматически при настройке) |
+| `WECOM_ENCODING_AES_KEY` | ✅ | Ключ шифрования AES (43 символа) | Там же, где Token → EncodingAESKey (генерируется автоматически при настройке) |
+| `WECOM_AGENT_ID` | ✅ | ID агента/приложения (AgentId) | WeCom Admin → Управление приложениями → Ваше приложение → AgentId (числовой, отображается вверху страницы) |
+| `BPMSOFT_OCC_CONNECTOR_URL` | ✅ | URL коннектора BPMSoft OCC | Адрес вашего BPMSoft OCC Connector, например `https://connector.yourdomain.com` |
+| `BPMSOFT_APP_ID` | ⚠️ | AppId канала в BPMSoft | BPMSoft → Настройки → Чаты → Каналы → Пользовательский канал → AppId (из таблицы Channel в БД коннектора) |
+| `BPMSOFT_CHANNEL_ID` | ⚠️ | GUID канала в BPMSoft | Приходит в тестовом hook при добавлении канала (JSON: `{"id": "channel_guid"}`) |
+| `PORT` | ❌ | Порт сервиса (по умолчанию `8080`) | Для Amvera оставить `8080` |
+| `LOG_LEVEL` | ❌ | Уровень логирования (по умолчанию `info`) | Варианты: `error`, `warn`, `info`, `debug` |
+
+> ⚠️ = требуется для интеграции с BPMSoft; сервис запустится без них, но пересылка не будет работать.
+
+---
 
 ## Быстрый старт
 
-### 1. WeChat Sandbox
+### 1. Создать приложение в WeCom
 
-1. Перейди на https://mp.weixin.qq.com/debug/cgi-bin/sandbox?t=sandbox/login
-2. Авторизуйся через QR-код в WeChat
-3. Запиши `appID` и `appsecret`
-4. Придумай Token (любая строка)
-5. URL и Token заполнишь после деплоя (или с ngrok для локальной разработки)
+1. Войдите в [WeCom Admin Console](https://work.weixin.qq.com/wework_admin/frame)
+2. Перейдите в **Управление приложениями** → **Создание приложения**
+3. Создайте самостоятельное приложение (自建应用)
+4. Запишите **AgentId** и **Secret**
+5. В настройках приложения → **Получение сообщений** (API接收消息):
+   - URL: `https://your-amvera-app.amvera.io/wecom`
+   - Token и EncodingAESKey — сгенерируйте и сохраните
 
-### 2. Локальная разработка
+### 2. Настроить BPMSoft OCC
+
+1. В BPMSoft добавьте **Пользовательский канал**
+2. Укажите адрес: `https://your-amvera-app.amvera.io/Home/InputJSON`
+3. Запишите `AppId` и `ChannelId`
+
+### 3. Локальный запуск
 
 ```bash
-# Клонируй репо
-cp .env.example .env
-# Заполни .env значениями из sandbox
+# Клонировать репозиторий
+git clone https://github.com/SergeSKM/WeComRoute.git
+cd WeComRoute
 
+# Установить зависимости
 npm install
+
+# Заполнить .env
+cp .env .env.local
+# Отредактировать .env переменными из таблицы выше
+
+# Запуск
+npm start
+
+# Разработка (auto-reload)
 npm run dev
-
-# В другом терминале — пробрось через ngrok:
-ngrok http 8080
-
-# Скопируй https URL из ngrok в настройки sandbox:
-# URL: https://xxxxx.ngrok.io/wechat
-# Token: значение из .env
 ```
 
-### 3. Деплой на Amvera
+### 4. Деплой на Amvera
 
-```bash
-# Установи Amvera CLI (если ещё нет)
-pip install amvera
+1. Подключите Git-репозиторий к проекту Amvera
+2. В **Настройки → Переменные окружения** добавьте все переменные из таблицы
+3. Amvera автоматически соберёт и запустит контейнер из `Dockerfile`
 
-# Создай проект
-amvera project create wechat-bpmsoft-bridge
-
-# Задай переменные окружения в панели Amvera:
-# WECHAT_APP_ID, WECHAT_APP_SECRET, WECHAT_TOKEN,
-# BPMSOFT_OCC_CONNECTOR_URL, BPMSOFT_CHANNEL_ID
-
-# Деплой через git push
-git init
-git remote add amvera https://git.amvera.ru/<username>/wechat-bpmsoft-bridge.git
-git add .
-git commit -m "initial"
-git push amvera master
-```
-
-После деплоя Amvera даст URL вида `https://wechat-bpmsoft-bridge-<user>.amvera.io`.
-
-Укажи `https://wechat-bpmsoft-bridge-<user>.amvera.io/wechat` как URL в настройках WeChat Sandbox.
-
-### 4. Настройка BPMSoft OCC
-
-1. Открой Дизайнер системы → Настройка чатов BPMSoft OCC
-2. В детали «Каналы» нажми «+»
-3. Выбери «Пользовательский канал (Custom Channel)»
-4. Укажи Webhook URL для исходящих: `https://wechat-bpmsoft-bridge-<user>.amvera.io/bpmsoft/outgoing`
-5. Запиши Channel ID и укажи его в переменной `BPMSOFT_CHANNEL_ID`
-6. Привяжи оператора к каналу
-7. Синхронизируй
+---
 
 ## API Endpoints
 
 | Метод | Путь | Описание |
-|-------|------|----------|
-| GET | `/wechat` | Верификация webhook (WeChat challenge) |
-| POST | `/wechat` | Приём входящих сообщений от WeChat (XML) |
-| POST | `/bpmsoft/outgoing` | Приём исходящих сообщений от BPMSoft OCC |
-| POST | `/bpmsoft/send` | Ручная отправка сообщения в WeChat (для тестов) |
-| GET | `/health` | Health check |
+|---|---|---|
+| `GET` | `/wecom` | Верификация callback URL от WeCom |
+| `POST` | `/wecom` | Приём зашифрованных сообщений от WeCom |
+| `POST` | `/Home/InputJSON` | Приём сообщений от BPMSoft OCC |
+| `GET` | `/health` | Health check (для мониторинга и Amvera) |
 
-### Тестовая отправка
+---
 
-```bash
-curl -X POST https://your-app.amvera.io/bpmsoft/send \
-  -H "Content-Type: application/json" \
-  -d '{"openId": "oXXXX_user_open_id", "text": "Привет из BPMSoft!"}'
-```
+## Поддерживаемые типы сообщений
 
-## Переменные окружения
+### WeCom → BPMSoft
+- ✅ Текст
+- ✅ Изображения (PicUrl)
+- ✅ Голосовые сообщения (как текст-заглушка)
+- ✅ Видео (как текст-заглушка)
+- ✅ Геолокация
+- ✅ Ссылки
 
-| Переменная | Обязательная | Описание |
-|------------|:---:|----------|
-| `WECHAT_APP_ID` | ✅ | AppID из WeChat Sandbox / Official Account |
-| `WECHAT_APP_SECRET` | ✅ | AppSecret из WeChat |
-| `WECHAT_TOKEN` | ✅ | Token для верификации webhook |
-| `BPMSOFT_OCC_CONNECTOR_URL` | | URL коннектора OCC (по умолчанию: https://connector.ai.bpmsoft.ru) |
-| `BPMSOFT_CHANNEL_ID` | | ID пользовательского канала в BPMSoft OCC |
-| `BPMSOFT_OCC_OUTGOING_WEBHOOK_SECRET` | | Секрет для проверки запросов от BPMSoft |
-| `PORT` | | Порт сервера (по умолчанию: 8080) |
-| `LOG_LEVEL` | | Уровень логирования (по умолчанию: info) |
-
-## Важные замечания
-
-- **WeChat Sandbox** не поддерживает шифрование сообщений — это нормально для тестирования
-- **Customer Service API** (отправка сообщений) работает только в течение 48 часов после последнего сообщения от пользователя
-- Для продакшена потребуется верифицированный Service Account с китайским юрлицом
-- URL коннектора BPMSoft OCC и формат Custom Channel API могут отличаться в зависимости от версии — уточняй в документации или у техподдержки BPMSoft
+### BPMSoft → WeCom
+- ✅ Текст
+- ✅ Кнопки (как нумерованный текст)
+- ✅ Изображения (загрузка в WeCom Media → отправка по media_id)
+- ✅ Файлы (загрузка в WeCom Media → отправка по media_id)
+- ✅ Геолокация (как текст)

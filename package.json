@@ -1,18 +1,19 @@
 {
-  "name": "wechat-bpmsoft-bridge",
-  "version": "1.0.0",
-  "description": "WeChat ↔ BPMSoft OCC middleware bridge",
+  "name": "wecom-bpmsoft-bridge",
+  "version": "2.0.0",
+  "description": "WeCom (企业微信) ↔ BPMSoft OCC middleware bridge",
   "main": "src/index.js",
   "scripts": {
     "start": "node src/index.js",
     "dev": "node --watch src/index.js"
   },
   "dependencies": {
-    "express": "^4.21.0",
+    "@wecom/crypto": "^1.0.1",
     "axios": "^1.7.0",
-    "xml2js": "^0.6.2",
-    "crypto": "^1.0.1",
     "dotenv": "^16.4.0",
-    "winston": "^3.14.0"
+    "express": "^4.21.0",
+    "form-data": "^4.0.0",
+    "winston": "^3.14.0",
+    "xml2js": "^0.6.2"
   }
 }
