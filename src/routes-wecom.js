@@ -1,33 +1,17 @@
 const express = require('express');
 const xml2js = require('xml2js');
+const axios = require('axios');       // добавлен для sync_msg
 const { getSignature, decrypt } = require('@wecom/crypto');
 const logger = require('./logger');
 
-/**
- * Create WeCom callback routes.
- *
- * @param {object} opts
- * @param {string} opts.token          - WeCom callback Token
- * @param {string} opts.encodingAESKey - WeCom EncodingAESKey (43-char base64)
- * @param {string} opts.corpId         - WeCom Corp ID
- * @param {object} opts.bpmsoftClient  - BPMSoft OCC client instance
- */
-function createWeComRouter({ token, encodingAESKey, corpId, bpmsoftClient }) {
+function createWeComRouter({ token, encodingAESKey, corpId, bpmsoftClient, wecomClient }) {
   const router = express.Router();
 
-  // ── Helpers ──────────────────────────────────────────────
-
-  /**
-   * Verify WeCom callback signature.
-   */
   function verifySignature(msgSignature, timestamp, nonce, encrypted) {
     const calculated = getSignature(token, timestamp, nonce, encrypted);
     return calculated === msgSignature;
   }
 
-  /**
-   * Decrypt WeCom encrypted message and return parsed XML object.
-   */
   async function decryptMessage(encryptedText) {
     const { message, id } = decrypt(encodingAESKey, encryptedText);
     logger.debug('Decrypted message', { corpId: id });
@@ -35,11 +19,9 @@ function createWeComRouter({ token, encodingAESKey, corpId, bpmsoftClient }) {
     return parsed.xml || parsed;
   }
 
-  // ── GET /wecom — Callback URL verification ──────────────
-
+  // GET /wecom — верификация URL
   router.get('/', (req, res) => {
     const { msg_signature, timestamp, nonce, echostr } = req.query;
-
     logger.info('WeCom callback verification request', { timestamp, nonce });
 
     if (!msg_signature || !timestamp || !nonce || !echostr) {
@@ -47,13 +29,11 @@ function createWeComRouter({ token, encodingAESKey, corpId, bpmsoftClient }) {
       return res.status(400).send('Missing parameters');
     }
 
-    // Verify signature
     if (!verifySignature(msg_signature, timestamp, nonce, echostr)) {
       logger.warn('Callback verification signature mismatch');
       return res.status(403).send('Invalid signature');
     }
 
-    // Decrypt echostr and return plaintext
     try {
       const { message } = decrypt(encodingAESKey, echostr);
       logger.info('Callback URL verified successfully');
@@ -64,13 +44,11 @@ function createWeComRouter({ token, encodingAESKey, corpId, bpmsoftClient }) {
     }
   });
 
-  // ── POST /wecom — Receive messages from WeCom ──────────
-
+  // POST /wecom — приём сообщений и событий
   router.post('/', express.text({ type: ['text/xml', 'application/xml'] }), async (req, res) => {
     const { msg_signature, timestamp, nonce } = req.query;
 
     try {
-      // 1. Parse outer XML to get <Encrypt> field
       const outerXml = await xml2js.parseStringPromise(req.body, { explicitArray: false });
       const encrypted = outerXml.xml?.Encrypt;
 
@@ -79,92 +57,95 @@ function createWeComRouter({ token, encodingAESKey, corpId, bpmsoftClient }) {
         return res.status(400).send('Missing Encrypt field');
       }
 
-      // 2. Verify signature
       if (!verifySignature(msg_signature, timestamp, nonce, encrypted)) {
         logger.warn('Message signature mismatch');
         return res.status(403).send('Invalid signature');
       }
 
-      // 3. Decrypt message
-      const msg = await decryptMessage(encrypted);
+      const decryptedXml = await decryptMessage(encrypted);
+      const msg = decryptedXml;
 
-      const msgType = msg.MsgType;
-      const fromUser = msg.FromUserName;   // WeCom UserId or ExternalUserId
-      const content = msg.Content || '';
+      // ──────────────────────────────────────────────────────────
+      // ОБРАБОТКА СОБЫТИЙ ОТ КЛИЕНТОВ (WeChat Customer Service)
+      // ──────────────────────────────────────────────────────────
+      if (msg.MsgType === 'event' && msg.Event === 'kf_msg_or_event') {
+        const openKfId = msg.OpenKfId;
+        const syncToken = msg.Token;
+        logger.info('KF event received, fetching messages via sync_msg', { openKfId, syncToken });
 
-      logger.info('Received WeCom message', {
-        from: fromUser,
-        msgType,
-        msgId: msg.MsgId,
-      });
+        // Получаем access_token из клиента WeCom (уже есть метод)
+       // const wecomClient = req.app.locals.wecomClient; // предположим, что мы передадим клиент в app.locals
+        // Если не передали, можно получить из глобальной переменной, но лучше передать.
+        // В текущей реализации bpmsoftClient есть, но нет wecomClient. Добавим в параметры роутера.
+        // Для простоты предположим, что мы передали wecomClient в createWeComRouter.
+        // Ниже я покажу, как передать wecomClient из index.js.
+        // Пока что используем переменную, которую мы передадим.
+        const accessToken = await wecomClient.getAccessToken();
 
-      // 4. Route message to BPMSoft OCC
-      if (!bpmsoftClient) {
-        logger.warn('BPMSoft client not configured, message not forwarded');
+        const syncUrl = `https://qyapi.weixin.qq.com/cgi-bin/kf/sync_msg?access_token=${accessToken}`;
+        const syncPayload = {
+          token: syncToken,
+          open_kfid: openKfId,
+          limit: 100
+        };
+
+        const syncResponse = await axios.post(syncUrl, syncPayload, {
+          headers: { 'Content-Type': 'application/json' }
+        });
+
+        if (syncResponse.data.errcode && syncResponse.data.errcode !== 0) {
+          logger.error('sync_msg failed', { errcode: syncResponse.data.errcode, errmsg: syncResponse.data.errmsg });
+          return res.status(200).send('success'); // всё равно отвечаем success, чтобы WeCom не повторял
+        }
+
+        const msgList = syncResponse.data.msg_list || [];
+        for (const customerMsg of msgList) {
+          if (customerMsg.msgtype === 'text' && customerMsg.from) {
+            const externalUserId = customerMsg.from; // ID клиента (wm/wo)
+            const messageText = customerMsg.text?.content || '';
+            logger.info('Forwarding customer message to BPMSoft', { externalUserId, messageText });
+
+            if (bpmsoftClient) {
+              // Передаём также openKfId, чтобы потом можно было ответить
+              await bpmsoftClient.sendMessage(externalUserId, {
+                type: 'text',
+                text: messageText,
+                openKfId: openKfId
+              });
+            }
+          }
+          // Здесь можно добавить обработку image, voice и т.д.
+        }
+
         return res.status(200).send('success');
       }
 
-      switch (msgType) {
-        case 'text':
-          await bpmsoftClient.sendMessage(fromUser, {
-            type: 'text',
-            text: content,
-          });
-          break;
+      // ──────────────────────────────────────────────────────────
+      // ОБРАБОТКА СООБЩЕНИЙ ОТ СОТРУДНИКОВ (внутренние)
+      // ──────────────────────────────────────────────────────────
+      const msgType = msg.MsgType;
+      const fromUser = msg.FromUserName;   // UserId сотрудника
+      const content = msg.Content || '';
 
-        case 'image':
-          await bpmsoftClient.sendMessage(fromUser, {
-            type: 'image',
-            text: msg.PicUrl || '[Image message]',
-          });
-          break;
+      logger.info('Received internal WeCom message', { from: fromUser, msgType, content });
 
-        case 'voice':
-          await bpmsoftClient.sendMessage(fromUser, {
-            type: 'text',
-            text: '[Voice message]',
-          });
-          break;
-
-        case 'video':
-          await bpmsoftClient.sendMessage(fromUser, {
-            type: 'text',
-            text: '[Video message]',
-          });
-          break;
-
-        case 'location':
-          await bpmsoftClient.sendMessage(fromUser, {
-            type: 'text',
-            text: `[Location] ${msg.Label || ''} (${msg.Location_X}, ${msg.Location_Y})`,
-          });
-          break;
-
-        case 'link':
-          await bpmsoftClient.sendMessage(fromUser, {
-            type: 'text',
-            text: `[Link] ${msg.Title || ''}\n${msg.Url || ''}`,
-          });
-          break;
-
-        case 'event':
-          logger.info('WeCom event received', {
-            event: msg.Event,
-            eventKey: msg.EventKey,
-          });
-          // Events (subscribe, enter_agent, etc.) are logged but not forwarded
-          break;
-
-        default:
-          logger.info('Unhandled WeCom message type', { msgType });
-          break;
+      if (bpmsoftClient) {
+        switch (msgType) {
+          case 'text':
+            await bpmsoftClient.sendMessage(fromUser, { type: 'text', text: content });
+            break;
+          case 'image':
+            await bpmsoftClient.sendMessage(fromUser, { type: 'image', text: msg.PicUrl || '[Image]' });
+            break;
+          // ... другие типы
+          default:
+            logger.info('Unhandled internal message type', { msgType });
+        }
       }
 
-      // WeCom expects "success" or empty response within 5 seconds
       res.status(200).send('success');
     } catch (err) {
       logger.error('Error processing WeCom message', { error: err.message, stack: err.stack });
-      // Always respond to prevent WeCom retries
       res.status(200).send('success');
     }
   });

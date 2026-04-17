@@ -14,14 +14,6 @@ class BPMSoftOCCClient {
     this.channelId = channelId;
   }
 
-  /**
-   * Отправить сообщение от клиента WeCom в BPMSoft OCC.
-   *
-   * API: POST {HOST}/api/v1.0/sendmessage/{AppId}/{ChannelId}
-   *
-   * @param {string} senderId — уникальный идентификатор клиента (WeCom UserId / ExternalUserId)
-   * @param {object} message  — объект сообщения { type, text }
-   */
   async sendMessage(senderId, message) {
     const url = `${this.connectorUrl}/api/v1.0/sendmessage/${this.appId}/${this.channelId}`;
 
@@ -33,14 +25,12 @@ class BPMSoftOCCClient {
       message: {
         type: message.type || 'text',
         text: message.text,
+        // Добавляем openKfId, если он передан (для ответа клиенту)
+        openKfId: message.openKfId || null,
       },
     };
 
-    logger.info('Sending to BPMSoft OCC', {
-      url,
-      senderId,
-      type: message.type,
-    });
+    logger.info('Sending to BPMSoft OCC', { url, senderId, type: message.type, hasOpenKfId: !!message.openKfId });
 
     try {
       const res = await axios.post(url, payload, {
@@ -48,12 +38,7 @@ class BPMSoftOCCClient {
         timeout: 10000,
       });
 
-      logger.info('Message forwarded to BPMSoft OCC', {
-        senderId,
-        type: message.type,
-        status: res.status,
-      });
-
+      logger.info('Message forwarded to BPMSoft OCC', { senderId, type: message.type, status: res.status });
       return res.data;
     } catch (err) {
       logger.error('Failed to forward message to BPMSoft OCC', {
