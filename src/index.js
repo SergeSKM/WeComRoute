@@ -45,13 +45,13 @@ app.get('/health', (req, res) => {
   });
 });
 
-// Передаём wecomClient в роутеры (для доступа из routes-wecom и routes-bpmsoft)
+// Передаём wecomClient в роутеры
 const wecomRouter = createWeComRouter({
   token: process.env.WECOM_TOKEN,
   encodingAESKey: process.env.WECOM_ENCODING_AES_KEY,
   corpId: process.env.WECOM_CORP_ID,
   bpmsoftClient,
-  wecomClient,      // добавлено
+  wecomClient,
 });
 
 const bpmsoftRouter = createBPMSoftRouter({ wecomClient });
