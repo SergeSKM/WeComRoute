@@ -3,9 +3,35 @@ const xml2js = require('xml2js');
 const axios = require('axios');
 const { getSignature, decrypt } = require('@wecom/crypto');
 const logger = require('./logger');
+const fs = require('fs');
+const path = require('path');
 
-// Хранилище курсоров для каждого open_kfid (в реальном проекте используйте Redis или БД)
-const kfCursors = new Map();
+// ПРАВКА 1: Постоянное хранилище для cursor'ов
+// Теперь курсоры хранятся в файле и не сбрасываются при перезапуске сервера.
+const CURSOR_FILE = path.join(__dirname, 'kf_cursors.json');
+let kfCursors = {};
+
+function loadCursors() {
+    try {
+        if (fs.existsSync(CURSOR_FILE)) {
+            kfCursors = JSON.parse(fs.readFileSync(CURSOR_FILE, 'utf8'));
+            logger.info('Loaded cursors from file', { count: Object.keys(kfCursors).length });
+        }
+    } catch (err) {
+        logger.error('Failed to load cursors', { error: err.message });
+    }
+}
+
+function saveCursors() {
+    try {
+        fs.writeFileSync(CURSOR_FILE, JSON.stringify(kfCursors, null, 2));
+    } catch (err) {
+        logger.error('Failed to save cursors', { error: err.message });
+    }
+}
+
+// Загружаем курсоры при инициализации модуля
+loadCursors();
 
 function createWeComRouter({ token, encodingAESKey, corpId, bpmsoftClient, wecomClient }) {
   const router = express.Router();
@@ -22,7 +48,7 @@ function createWeComRouter({ token, encodingAESKey, corpId, bpmsoftClient, wecom
     return parsed.xml || parsed;
   }
 
-  // GET /wecom — верификация URL
+  // GET /wecom — верификация URL (без изменений)
   router.get('/', (req, res) => {
     const { msg_signature, timestamp, nonce, echostr } = req.query;
     logger.info('WeCom callback verification request', { timestamp, nonce });
@@ -70,121 +96,120 @@ function createWeComRouter({ token, encodingAESKey, corpId, bpmsoftClient, wecom
       const msg = decryptedXml;
       logger.debug('Decrypted message structure', { msgType: msg.MsgType, event: msg.Event });
 
-      // ──────────────────────────────────────────────────────────
-      // ОБРАБОТКА СОБЫТИЙ ОТ КЛИЕНТОВ (WeChat Customer Service)
-      // ──────────────────────────────────────────────────────────
       if (msg.MsgType === 'event' && msg.Event === 'kf_msg_or_event') {
         const openKfId = msg.OpenKfId;
         const syncToken = msg.Token;
         logger.info('KF event received', { openKfId, syncToken });
 
-        try {
-          const accessToken = await wecomClient.getAccessToken();
-          const syncUrl = `https://qyapi.weixin.qq.com/cgi-bin/kf/sync_msg?access_token=${accessToken}`;
+        // ПРАВКА 2: Асинхронная обработка (не ждём результат, чтобы сразу ответить 200)
+        setImmediate(async () => {
+          try {
+            // ПРАВКА 1: Используем курсор из постоянного хранилища
+            let cursor = kfCursors[openKfId] || '';
+            logger.info('Processing KF event with cursor', { openKfId, cursor });
 
-          // Получаем сохранённый курсор для этого open_kfid
-          let cursor = kfCursors.get(openKfId) || '';
-          let allMessages = [];
-          let nextCursor = null;
-          let hasMore = true;
+            const accessToken = await wecomClient.getAccessToken();
+            const syncUrl = `https://qyapi.weixin.qq.com/cgi-bin/kf/sync_msg?access_token=${accessToken}`;
 
-          while (hasMore) {
-            const syncPayload = {
-              token: syncToken,
-              open_kfid: openKfId,
-              cursor: cursor,
-              limit: 100
-            };
-            logger.debug('Calling sync_msg', { url: syncUrl, payload: syncPayload });
+            let allMessages = [];
+            let nextCursor = null;
+            let hasMore = true;
 
-            const syncResponse = await axios.post(syncUrl, syncPayload, {
-              headers: { 'Content-Type': 'application/json' }
-            });
+            // Цикл для получения всех страниц сообщений
+            while (hasMore) {
+              const syncPayload = {
+                token: syncToken,
+                open_kfid: openKfId,
+                cursor: cursor,
+                limit: 100
+              };
+              logger.debug('Calling sync_msg', { url: syncUrl, payload: syncPayload });
 
-            if (syncResponse.data.errcode && syncResponse.data.errcode !== 0) {
-              logger.error('sync_msg failed', { errcode: syncResponse.data.errcode, errmsg: syncResponse.data.errmsg });
-              break;
-            }
+              const syncResponse = await axios.post(syncUrl, syncPayload, {
+                headers: { 'Content-Type': 'application/json' }
+              });
 
-            const msgList = syncResponse.data.msg_list || [];
-            allMessages.push(...msgList);
+              if (syncResponse.data.errcode && syncResponse.data.errcode !== 0) {
+                logger.error('sync_msg failed', { errcode: syncResponse.data.errcode, errmsg: syncResponse.data.errmsg });
+                break;
+              }
 
-            nextCursor = syncResponse.data.next_cursor;
-            if (nextCursor) {
-              cursor = nextCursor;
-              // Продолжаем забирать следующую страницу
-            } else {
-              hasMore = false;
-            }
-          }
+              const msgList = syncResponse.data.msg_list || [];
+              allMessages.push(...msgList);
 
-          // Сохраняем последний курсор для следующего раза
-          if (nextCursor) {
-            kfCursors.set(openKfId, nextCursor);
-            logger.info('Saved cursor for open_kfid', { openKfId, cursor: nextCursor });
-          }
+              nextCursor = syncResponse.data.next_cursor;
+              hasMore = syncResponse.data.has_more === 1;
 
-          logger.info(`sync_msg returned ${allMessages.length} total messages (after cursor)`);
-
-          // Для избежания дубликатов в пределах одного вызова можно использовать Set по msgid,
-          // но курсор уже гарантирует, что старые сообщения не повторяются (если правильно сохранять).
-          // Однако на всякий случай отфильтруем по msgid за последние 5 минут (опционально).
-          const processedMsgIds = new Set();
-
-          for (const customerMsg of allMessages) {
-            const msgId = customerMsg.msgid;
-            if (processedMsgIds.has(msgId)) {
-              logger.debug('Duplicate message skipped', { msgId });
-              continue;
-            }
-            processedMsgIds.add(msgId);
-
-            const msgType = customerMsg.msgtype || customerMsg.MsgType;
-            const externalUserId = customerMsg.external_userid || customerMsg.from;
-
-            if (!externalUserId) {
-              logger.warn('No external user ID in message', { msg: customerMsg });
-              continue;
-            }
-
-            if (msgType === 'text') {
-              const messageText = customerMsg.text?.content || '';
-              logger.info('Forwarding customer text to BPMSoft', { externalUserId, messageText, openKfId });
-
-              if (bpmsoftClient) {
-                await bpmsoftClient.sendMessage(externalUserId, {
-                  type: 'text',
-                  text: messageText,
-                  openKfId: openKfId
-                });
+              if (hasMore && nextCursor) {
+                cursor = nextCursor;
               } else {
-                logger.error('bpmsoftClient is not available');
+                hasMore = false;
               }
-            } else if (msgType === 'image') {
-              const mediaId = customerMsg.image?.media_id;
-              logger.info('Forwarding customer image to BPMSoft', { externalUserId, mediaId, openKfId });
-              if (bpmsoftClient) {
-                await bpmsoftClient.sendMessage(externalUserId, {
-                  type: 'text',
-                  text: `[Image message, media_id: ${mediaId}]`,
-                  openKfId: openKfId
-                });
-              }
-            } else if (msgType === 'event') {
-              logger.info('Ignoring customer event', { event: customerMsg.event });
-            } else {
-              logger.info('Unhandled customer message type', { msgtype: msgType });
             }
+
+            // ПРАВКА 1: Сохраняем новый курсор для этого open_kfid
+            if (nextCursor && nextCursor !== kfCursors[openKfId]) {
+              kfCursors[openKfId] = nextCursor;
+              saveCursors();
+              logger.info('Saved new cursor for open_kfid', { openKfId, cursor: nextCursor });
+            }
+
+            logger.info(`sync_msg returned ${allMessages.length} total messages`);
+
+            // ПРАВКА 3: Усиленная обработка ошибок для каждого сообщения
+            for (const customerMsg of allMessages) {
+              try {
+                const msgType = customerMsg.msgtype || customerMsg.MsgType;
+                const externalUserId = customerMsg.external_userid || customerMsg.from;
+
+                if (!externalUserId) {
+                  logger.warn('No external user ID in message', { msg: customerMsg });
+                  continue;
+                }
+
+                if (msgType === 'text') {
+                  const messageText = customerMsg.text?.content || '';
+                  logger.info('Forwarding customer text to BPMSoft', { externalUserId, messageText, openKfId });
+
+                  if (bpmsoftClient) {
+                    await bpmsoftClient.sendMessage(externalUserId, {
+                      type: 'text',
+                      text: messageText,
+                      openKfId: openKfId
+                    });
+                  } else {
+                    logger.error('bpmsoftClient is not available');
+                  }
+                } else if (msgType === 'image') {
+                  const mediaId = customerMsg.image?.media_id;
+                  logger.info('Forwarding customer image to BPMSoft', { externalUserId, mediaId, openKfId });
+                  if (bpmsoftClient) {
+                    await bpmsoftClient.sendMessage(externalUserId, {
+                      type: 'text',
+                      text: `[Image message, media_id: ${mediaId}]`,
+                      openKfId: openKfId
+                    });
+                  }
+                } else if (msgType === 'event') {
+                  logger.info('Ignoring customer event', { event: customerMsg.event });
+                } else {
+                  logger.info('Unhandled customer message type', { msgtype: msgType });
+                }
+              } catch (msgErr) {
+                // Логируем ошибку, но не прерываем обработку остальных сообщений
+                logger.error('Error processing single customer message', { error: msgErr.message, msg: customerMsg });
+              }
+            }
+          } catch (err) {
+            logger.error('Error processing KF event in background', { error: err.message, stack: err.stack });
           }
-        } catch (err) {
-          logger.error('Error processing KF event', { error: err.message, stack: err.stack });
-        }
+        });
+
+        // ПРАВКА 2: Отвечаем 200 OK немедленно, до начала асинхронной обработки
         return res.status(200).send('success');
       }
 
-      // ──────────────────────────────────────────────────────────
-      // ОБРАБОТКА СООБЩЕНИЙ ОТ СОТРУДНИКОВ (внутренние)
-      // ──────────────────────────────────────────────────────────
+      // ОБРАБОТКА СООБЩЕНИЙ ОТ СОТРУДНИКОВ (без изменений)
       const msgType = msg.MsgType;
       const fromUser = msg.FromUserName;
       const content = msg.Content || '';
