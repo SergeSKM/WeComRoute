@@ -95,8 +95,22 @@ function createWeComRouter({ token, encodingAESKey, corpId, bpmsoftClient, wecom
 
           for (const customerMsg of msgList) {
             logger.debug('Processing customer message', { msg: customerMsg });
-            if (customerMsg.msgtype === 'text' && customerMsg.from) {
-              const externalUserId = customerMsg.from;
+
+            // Определяем тип сообщения, учитывая возможные варианты полей
+            const msgType = customerMsg.msgtype || customerMsg.MsgType;
+            if (!msgType) {
+              logger.warn('Message has no type', { msg: customerMsg });
+              continue;
+            }
+
+            // Извлекаем ID внешнего пользователя
+            const externalUserId = customerMsg.external_userid || customerMsg.from;
+            if (!externalUserId) {
+              logger.warn('No external user ID in message', { msg: customerMsg });
+              continue;
+            }
+
+            if (msgType === 'text') {
               const messageText = customerMsg.text?.content || '';
               logger.info('Forwarding customer text to BPMSoft', { externalUserId, messageText, openKfId });
 
@@ -106,20 +120,27 @@ function createWeComRouter({ token, encodingAESKey, corpId, bpmsoftClient, wecom
                   text: messageText,
                   openKfId: openKfId
                 });
+              } else {
+                logger.error('bpmsoftClient is not available');
               }
-            } else if (customerMsg.msgtype === 'image') {
-              // Пример обработки изображений – можно расширить
-              logger.info('Received image from customer', { from: customerMsg.from, imageUrl: customerMsg.image?.media_id });
-              // Здесь можно отправить в BPMSoft как текст с ссылкой или media_id
+            }
+            else if (msgType === 'image') {
+              const mediaId = customerMsg.image?.media_id;
+              logger.info('Forwarding customer image to BPMSoft', { externalUserId, mediaId, openKfId });
               if (bpmsoftClient) {
-                await bpmsoftClient.sendMessage(customerMsg.from, {
+                await bpmsoftClient.sendMessage(externalUserId, {
                   type: 'text',
-                  text: `[Image message received]`,
+                  text: `[Image message, media_id: ${mediaId}]`,
                   openKfId: openKfId
                 });
               }
-            } else {
-              logger.info('Unhandled customer message type', { msgtype: customerMsg.msgtype });
+            }
+            else if (msgType === 'event') {
+              // Игнорируем события (enter_session и т.д.)
+              logger.info('Ignoring customer event', { event: customerMsg.event });
+            }
+            else {
+              logger.info('Unhandled customer message type', { msgtype: msgType });
             }
           }
         } catch (err) {
