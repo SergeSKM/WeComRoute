@@ -3,12 +3,12 @@ const xml2js = require('xml2js');
 const axios = require('axios');
 const { getSignature, decrypt } = require('@wecom/crypto');
 const logger = require('./logger');
+const { setKfId } = require('./kf-map');
 const fs = require('fs');
 const path = require('path');
 
-// ПРАВКА 1: Постоянное хранилище для cursor'ов
-// Теперь курсоры хранятся в файле и не сбрасываются при перезапуске сервера.
-const CURSOR_FILE = path.join(__dirname, 'kf_cursors.json');
+// Постоянное хранилище для cursor'ов (в файле)
+const CURSOR_FILE = path.join('/tmp', 'kf_cursors.json');
 let kfCursors = {};
 
 function loadCursors() {
@@ -30,7 +30,6 @@ function saveCursors() {
     }
 }
 
-// Загружаем курсоры при инициализации модуля
 loadCursors();
 
 function createWeComRouter({ token, encodingAESKey, corpId, bpmsoftClient, wecomClient }) {
@@ -48,7 +47,7 @@ function createWeComRouter({ token, encodingAESKey, corpId, bpmsoftClient, wecom
     return parsed.xml || parsed;
   }
 
-  // GET /wecom — верификация URL (без изменений)
+  // GET /wecom — верификация URL
   router.get('/', (req, res) => {
     const { msg_signature, timestamp, nonce, echostr } = req.query;
     logger.info('WeCom callback verification request', { timestamp, nonce });
@@ -101,10 +100,8 @@ function createWeComRouter({ token, encodingAESKey, corpId, bpmsoftClient, wecom
         const syncToken = msg.Token;
         logger.info('KF event received', { openKfId, syncToken });
 
-        // ПРАВКА 2: Асинхронная обработка (не ждём результат, чтобы сразу ответить 200)
         setImmediate(async () => {
           try {
-            // ПРАВКА 1: Используем курсор из постоянного хранилища
             let cursor = kfCursors[openKfId] || '';
             logger.info('Processing KF event with cursor', { openKfId, cursor });
 
@@ -115,7 +112,6 @@ function createWeComRouter({ token, encodingAESKey, corpId, bpmsoftClient, wecom
             let nextCursor = null;
             let hasMore = true;
 
-            // Цикл для получения всех страниц сообщений
             while (hasMore) {
               const syncPayload = {
                 token: syncToken,
@@ -147,7 +143,6 @@ function createWeComRouter({ token, encodingAESKey, corpId, bpmsoftClient, wecom
               }
             }
 
-            // ПРАВКА 1: Сохраняем новый курсор для этого open_kfid
             if (nextCursor && nextCursor !== kfCursors[openKfId]) {
               kfCursors[openKfId] = nextCursor;
               saveCursors();
@@ -156,7 +151,6 @@ function createWeComRouter({ token, encodingAESKey, corpId, bpmsoftClient, wecom
 
             logger.info(`sync_msg returned ${allMessages.length} total messages`);
 
-            // ПРАВКА 3: Усиленная обработка ошибок для каждого сообщения
             for (const customerMsg of allMessages) {
               try {
                 const msgType = customerMsg.msgtype || customerMsg.MsgType;
@@ -171,6 +165,9 @@ function createWeComRouter({ token, encodingAESKey, corpId, bpmsoftClient, wecom
                   const messageText = customerMsg.text?.content || '';
                   logger.info('Forwarding customer text to BPMSoft', { externalUserId, messageText, openKfId });
 
+                  // Сохраняем соответствие externalUserId -> openKfId
+                  setKfId(externalUserId, openKfId);
+
                   if (bpmsoftClient) {
                     await bpmsoftClient.sendMessage(externalUserId, {
                       type: 'text',
@@ -183,6 +180,7 @@ function createWeComRouter({ token, encodingAESKey, corpId, bpmsoftClient, wecom
                 } else if (msgType === 'image') {
                   const mediaId = customerMsg.image?.media_id;
                   logger.info('Forwarding customer image to BPMSoft', { externalUserId, mediaId, openKfId });
+                  setKfId(externalUserId, openKfId);
                   if (bpmsoftClient) {
                     await bpmsoftClient.sendMessage(externalUserId, {
                       type: 'text',
@@ -196,7 +194,6 @@ function createWeComRouter({ token, encodingAESKey, corpId, bpmsoftClient, wecom
                   logger.info('Unhandled customer message type', { msgtype: msgType });
                 }
               } catch (msgErr) {
-                // Логируем ошибку, но не прерываем обработку остальных сообщений
                 logger.error('Error processing single customer message', { error: msgErr.message, msg: customerMsg });
               }
             }
@@ -205,11 +202,10 @@ function createWeComRouter({ token, encodingAESKey, corpId, bpmsoftClient, wecom
           }
         });
 
-        // ПРАВКА 2: Отвечаем 200 OK немедленно, до начала асинхронной обработки
         return res.status(200).send('success');
       }
 
-      // ОБРАБОТКА СООБЩЕНИЙ ОТ СОТРУДНИКОВ (без изменений)
+      // Обработка сообщений от сотрудников (внутренние)
       const msgType = msg.MsgType;
       const fromUser = msg.FromUserName;
       const content = msg.Content || '';

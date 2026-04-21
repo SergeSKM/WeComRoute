@@ -37,7 +37,6 @@ class WeComClient {
     }
   }
 
-  // Оригинальный метод для отправки сообщений сотрудникам (внутренний чат)
   async sendText(toUser, content) {
     const token = await this.getAccessToken();
     const payload = {
@@ -63,12 +62,6 @@ class WeComClient {
     }
   }
 
-  /**
-   * НОВЫЙ МЕТОД: отправка текста внешнему клиенту через WeChat Customer Service API
-   * @param {string} externalUserId - external_userid клиента (начинается с wm/wo)
-   * @param {string} openKfId - ID вашего客服账号 (wk...)
-   * @param {string} content - текст сообщения
-   */
   async sendKfText(externalUserId, openKfId, content) {
     const token = await this.getAccessToken();
     const payload = {
@@ -94,7 +87,6 @@ class WeComClient {
     }
   }
 
-  // Остальные методы (uploadMedia, sendImage, sendFile) остаются без изменений
   async uploadMedia(mediaUrl, type = 'image') {
     const token = await this.getAccessToken();
     const FormData = require('form-data');
