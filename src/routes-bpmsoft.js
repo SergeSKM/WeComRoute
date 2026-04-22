@@ -2,6 +2,10 @@ const { Router } = require('express');
 const logger = require('./logger');
 const { getKfId } = require('./kf-map');
 
+// ID сотрудника, который будет назначен для переоткрытия сессии
+// Укажите реальный UserId менеджера (например, 'annapavlova')
+const DEFAULT_SERVICER_USERID = 'annapavlova';
+
 function createBPMSoftRouter({ wecomClient }) {
   const router = Router();
 
@@ -10,22 +14,20 @@ function createBPMSoftRouter({ wecomClient }) {
       const payload = req.body;
       logger.info('BPMSoft OCC message received', { payload });
 
-      // Тестовый hook при добавлении канала
       if (payload.id && !payload.type && !payload.receiver_id) {
-        logger.info('BPMSoft OCC test hook received (channel registration)', { channelId: payload.id });
+        logger.info('BPMSoft OCC test hook received', { channelId: payload.id });
         return res.status(200).json({ ok: true });
       }
 
       let { receiver_id, type, content, openKfId } = payload;
       if (!receiver_id) {
-        logger.warn('Missing receiver_id in BPMSoft payload');
+        logger.warn('Missing receiver_id');
         return res.status(200).json({ ok: true });
       }
 
       const userId = receiver_id;
       const isExternal = userId.startsWith('wm') || userId.startsWith('wo');
 
-      // Если openKfId не передан, но пользователь внешний – пытаемся восстановить из хранилища
       if (isExternal && !openKfId) {
         openKfId = getKfId(userId);
         if (openKfId) {
@@ -36,99 +38,63 @@ function createBPMSoftRouter({ wecomClient }) {
         }
       }
 
+      // Исправленная функция sendWithReopen
+      const sendWithReopen = async (userId, openKfId, text) => {
+        try {
+          // 1. Получаем текущее состояние сессии
+          const { service_state, servicer_userid } = await wecomClient.getServiceState(openKfId, userId);
+          logger.info('Current service state before send', { userId, service_state, servicer_userid });
+
+          // 2. Если сессия не активна (service_state !== 3), пытаемся переоткрыть
+          if (service_state !== 3) {
+            logger.info('Session not active, attempting to reopen', { userId, service_state });
+            const targetServicer = servicer_userid || DEFAULT_SERVICER_USERID;
+            await wecomClient.changeServiceState(openKfId, userId, 3, targetServicer);
+            logger.info('Session state changed to 3 (manual service)', { userId, targetServicer });
+            await new Promise(resolve => setTimeout(resolve, 500));
+          }
+
+          // 3. Отправляем сообщение
+          await wecomClient.sendKfText(userId, openKfId, text);
+          logger.info('Message sent successfully after state check', { userId });
+        } catch (err) {
+          logger.error('Failed to send message after reopen attempt', { error: err.message, stack: err.stack });
+          throw err;
+        }
+      };
+
       switch (type) {
         case 'text': {
           const text = content?.text;
-          if (text) {
-            if (isExternal && openKfId) {
-              await wecomClient.sendKfText(userId, openKfId, text);
-            } else {
-              await wecomClient.sendText(userId, text);
-            }
-          }
-          break;
-        }
+          if (!text) break;
 
-        case 'buttons': {
-          let text = content?.text || '';
-          if (content?.buttons && content.buttons.length > 0) {
-            text += '\n\n' + content.buttons.map((btn, i) => `${i + 1}. ${btn}`).join('\n');
-          }
-          if (text) {
-            if (isExternal && openKfId) {
-              await wecomClient.sendKfText(userId, openKfId, text);
-            } else {
-              await wecomClient.sendText(userId, text);
-            }
+          if (isExternal && openKfId) {
+            await sendWithReopen(userId, openKfId, text);
+          } else if (!isExternal) {
+            await wecomClient.sendText(userId, text);
+          } else {
+            logger.error('Cannot send to external user: missing openKfId', { userId, openKfId });
           }
           break;
         }
 
         case 'image': {
           const imageUrl = content?.text;
-          if (imageUrl) {
+          if (imageUrl && isExternal && openKfId) {
+            await sendWithReopen(userId, openKfId, `[Image]: ${imageUrl}`);
+          } else if (imageUrl && !isExternal) {
             try {
               const mediaId = await wecomClient.uploadMedia(imageUrl, 'image');
-              if (isExternal && openKfId) {
-                await wecomClient.sendKfText(userId, openKfId, `[Image]: ${imageUrl}`);
-              } else {
-                await wecomClient.sendImage(userId, mediaId);
-              }
+              await wecomClient.sendImage(userId, mediaId);
             } catch (err) {
-              logger.warn('Image upload failed, sending as text link', { error: err.message });
-              if (isExternal && openKfId) {
-                await wecomClient.sendKfText(userId, openKfId, `[Image]: ${imageUrl}`);
-              } else {
-                await wecomClient.sendText(userId, `[Image]: ${imageUrl}`);
-              }
+              await wecomClient.sendText(userId, `[Image]: ${imageUrl}`);
             }
           }
           break;
         }
-
-        case 'file': {
-          const fileUrl = content?.text;
-          if (fileUrl) {
-            try {
-              const mediaId = await wecomClient.uploadMedia(fileUrl, 'file');
-              if (isExternal && openKfId) {
-                await wecomClient.sendKfText(userId, openKfId, `[File]: ${fileUrl}`);
-              } else {
-                await wecomClient.sendFile(userId, mediaId);
-              }
-            } catch (err) {
-              logger.warn('File upload failed, sending as text link', { error: err.message });
-              if (isExternal && openKfId) {
-                await wecomClient.sendKfText(userId, openKfId, `[File]: ${fileUrl}`);
-              } else {
-                await wecomClient.sendText(userId, `[File]: ${fileUrl}`);
-              }
-            }
-          }
-          break;
-        }
-
-        case 'location': {
-          const loc = content?.text;
-          if (loc) {
-            const text = typeof loc === 'object'
-              ? `[Location]: ${loc.lat}, ${loc.lng}`
-              : `[Location]: ${loc}`;
-            if (isExternal && openKfId) {
-              await wecomClient.sendKfText(userId, openKfId, text);
-            } else {
-              await wecomClient.sendText(userId, text);
-            }
-          }
-          break;
-        }
-
-        case 'operator_info':
-          logger.info('Operator info received', { operatorInfo: content, userId });
-          break;
 
         default:
-          logger.warn('Unknown message type from BPMSoft', { type, payload });
+          logger.warn('Unknown message type', { type });
       }
 
       return res.status(200).json({ ok: true });

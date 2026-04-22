@@ -37,6 +37,7 @@ class WeComClient {
     }
   }
 
+  // Отправка сотруднику (внутренний чат)
   async sendText(toUser, content) {
     const token = await this.getAccessToken();
     const payload = {
@@ -62,6 +63,7 @@ class WeComClient {
     }
   }
 
+  // Отправка внешнему клиенту через API客服
   async sendKfText(externalUserId, openKfId, content) {
     const token = await this.getAccessToken();
     const payload = {
@@ -87,6 +89,66 @@ class WeComClient {
     }
   }
 
+  /**
+   * Получить текущее состояние сессии с клиентом
+   */
+  async getServiceState(openKfId, externalUserId) {
+    const token = await this.getAccessToken();
+    const url = `${WECOM_API_BASE}/kf/service_state/get?access_token=${token}`;
+    const payload = {
+      open_kfid: openKfId,
+      external_userid: externalUserId
+    };
+    try {
+      const res = await axios.post(url, payload);
+      if (res.data.errcode !== 0) {
+        logger.error('getServiceState failed', { errcode: res.data.errcode, errmsg: res.data.errmsg });
+        throw new Error(`Get service state error: ${res.data.errcode} ${res.data.errmsg}`);
+      }
+      logger.debug('Service state', { externalUserId, service_state: res.data.service_state });
+      return {
+        service_state: res.data.service_state,
+        servicer_userid: res.data.servicer_userid
+      };
+    } catch (err) {
+      logger.error('Failed to get service state', { error: err.message });
+      throw err;
+    }
+  }
+
+  /**
+   * Изменить состояние сессии (например, переоткрыть закрытую)
+   * @param {string} openKfId
+   * @param {string} externalUserId
+   * @param {number} targetState - целевое состояние (3 =人工接待)
+   * @param {string} servicerUserid - ID сотрудника, который будет вести диалог (обязательно для state=3)
+   */
+  async changeServiceState(openKfId, externalUserId, targetState, servicerUserid) {
+    const token = await this.getAccessToken();
+    const url = `${WECOM_API_BASE}/kf/service_state/trans?access_token=${token}`;
+    const payload = {
+      open_kfid: openKfId,
+      external_userid: externalUserId,
+      service_state: targetState,
+    };
+    if (targetState === 3 && servicerUserid) {
+      payload.servicer_userid = servicerUserid;
+    }
+    try {
+      const res = await axios.post(url, payload);
+      if (res.data.errcode !== 0) {
+        logger.error('changeServiceState failed', { errcode: res.data.errcode, errmsg: res.data.errmsg });
+        throw new Error(`Change service state error: ${res.data.errcode} ${res.data.errmsg}`);
+      }
+      logger.info('Service state changed', { externalUserId, targetState, servicerUserid, msg_code: res.data.msg_code });
+      return res.data;
+    } catch (err) {
+      logger.error('Failed to change service state', { error: err.message });
+      throw err;
+    }
+  }
+
+  // Загрузка медиа (без изменений)
   async uploadMedia(mediaUrl, type = 'image') {
     const token = await this.getAccessToken();
     const FormData = require('form-data');
