@@ -7,7 +7,6 @@ const { setKfId } = require('./kf-map');
 const fs = require('fs');
 const path = require('path');
 
-// Постоянное хранилище для cursor'ов (в файле)
 const CURSOR_FILE = path.join('/tmp', 'kf_cursors.json');
 let kfCursors = {};
 
@@ -47,7 +46,6 @@ function createWeComRouter({ token, encodingAESKey, corpId, bpmsoftClient, wecom
     return parsed.xml || parsed;
   }
 
-  // GET /wecom — верификация URL
   router.get('/', (req, res) => {
     const { msg_signature, timestamp, nonce, echostr } = req.query;
     logger.info('WeCom callback verification request', { timestamp, nonce });
@@ -72,7 +70,6 @@ function createWeComRouter({ token, encodingAESKey, corpId, bpmsoftClient, wecom
     }
   });
 
-  // POST /wecom — приём сообщений и событий
   router.post('/', express.text({ type: ['text/xml', 'application/xml'] }), async (req, res) => {
     const { msg_signature, timestamp, nonce } = req.query;
     logger.debug('POST /wecom called', { msg_signature, timestamp, nonce, bodyLength: req.body?.length });
@@ -161,18 +158,26 @@ function createWeComRouter({ token, encodingAESKey, corpId, bpmsoftClient, wecom
                   continue;
                 }
 
+                // Сохраняем openKfId для внешнего пользователя
+                setKfId(externalUserId, openKfId);
+
                 if (msgType === 'text') {
                   const messageText = customerMsg.text?.content || '';
-                  logger.info('Forwarding customer text to BPMSoft', { externalUserId, messageText, openKfId });
+                  
+                  // ★★★ ПОЛУЧАЕМ ИМЯ КЛИЕНТА ★★★
+                  const customerInfo = await wecomClient.getCustomerInfo(externalUserId);
+                  const customerName = customerInfo?.nickname || externalUserId;
+                  const customerAvatar = customerInfo?.avatar || '';
 
-                  // Сохраняем соответствие externalUserId -> openKfId
-                  setKfId(externalUserId, openKfId);
+                  logger.info('Forwarding customer text to BPMSoft', { externalUserId, customerName, customerAvatar, messageText, openKfId });
 
                   if (bpmsoftClient) {
                     await bpmsoftClient.sendMessage(externalUserId, {
                       type: 'text',
                       text: messageText,
-                      openKfId: openKfId
+                      openKfId: openKfId,
+                      customerName: customerName,
+                      customerAvatar: customerAvatar
                     });
                   } else {
                     logger.error('bpmsoftClient is not available');
@@ -180,7 +185,6 @@ function createWeComRouter({ token, encodingAESKey, corpId, bpmsoftClient, wecom
                 } else if (msgType === 'image') {
                   const mediaId = customerMsg.image?.media_id;
                   logger.info('Forwarding customer image to BPMSoft', { externalUserId, mediaId, openKfId });
-                  setKfId(externalUserId, openKfId);
                   if (bpmsoftClient) {
                     await bpmsoftClient.sendMessage(externalUserId, {
                       type: 'text',

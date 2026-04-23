@@ -2,12 +2,6 @@ const axios = require('axios');
 const logger = require('./logger');
 
 class BPMSoftOCCClient {
-  /**
-   * @param {object} opts
-   * @param {string} opts.connectorUrl — адрес коннектора BPMSoft OCC (BPMSoftOCCOperatorHost)
-   * @param {string} opts.appId        — AppId (секретный ключ из таблицы Channel коннектора)
-   * @param {string} opts.channelId    — ChannelId (GUID, полученный в тестовом hook при добавлении канала)
-   */
   constructor({ connectorUrl, appId, channelId }) {
     this.connectorUrl = connectorUrl.replace(/\/$/, '');
     this.appId = appId;
@@ -20,17 +14,17 @@ class BPMSoftOCCClient {
     const payload = {
       sender: {
         id: senderId,
-        name: `WeCom User ${senderId.substring(0, 8)}`,
+        name: message.customerName || `WeCom User ${senderId.substring(0, 8)}`,  // используем переданное имя
+        avatar: message.customerAvatar || '',  // опционально
       },
       message: {
         type: message.type || 'text',
         text: message.text,
-        // Добавляем openKfId, если он передан (для ответа клиенту)
         openKfId: message.openKfId || null,
       },
     };
 
-    logger.info('Sending to BPMSoft OCC', { url, senderId, type: message.type, hasOpenKfId: !!message.openKfId });
+    logger.info('Sending to BPMSoft OCC', { url, senderId, type: message.type, customerName: payload.sender.name });
 
     try {
       const res = await axios.post(url, payload, {
