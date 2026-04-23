@@ -37,7 +37,6 @@ class WeComClient {
     }
   }
 
-  // Отправка сотруднику (внутренний чат)
   async sendText(toUser, content) {
     const token = await this.getAccessToken();
     const payload = {
@@ -63,7 +62,6 @@ class WeComClient {
     }
   }
 
-  // Отправка внешнему клиенту через API客服
   async sendKfText(externalUserId, openKfId, content) {
     const token = await this.getAccessToken();
     const payload = {
@@ -89,9 +87,6 @@ class WeComClient {
     }
   }
 
-  /**
-   * Получить текущее состояние сессии с клиентом
-   */
   async getServiceState(openKfId, externalUserId) {
     const token = await this.getAccessToken();
     const url = `${WECOM_API_BASE}/kf/service_state/get?access_token=${token}`;
@@ -116,13 +111,6 @@ class WeComClient {
     }
   }
 
-  /**
-   * Изменить состояние сессии (например, переоткрыть закрытую)
-   * @param {string} openKfId
-   * @param {string} externalUserId
-   * @param {number} targetState - целевое состояние (3 =人工接待)
-   * @param {string} servicerUserid - ID сотрудника, который будет вести диалог (обязательно для state=3)
-   */
   async changeServiceState(openKfId, externalUserId, targetState, servicerUserid) {
     const token = await this.getAccessToken();
     const url = `${WECOM_API_BASE}/kf/service_state/trans?access_token=${token}`;
@@ -148,7 +136,40 @@ class WeComClient {
     }
   }
 
-  // Загрузка медиа (без изменений)
+  // НОВЫЙ МЕТОД: получение информации о клиенте (имя, аватар)
+  async getCustomerInfo(externalUserId) {
+    const token = await this.getAccessToken();
+    const url = `${WECOM_API_BASE}/kf/customer/batchget?access_token=${token}`;
+    const payload = {
+      external_userid_list: [externalUserId],
+      need_enter_session_context: 0
+    };
+
+    try {
+      const res = await axios.post(url, payload);
+      if (res.data.errcode !== 0) {
+        logger.error('getCustomerInfo failed', { errcode: res.data.errcode, errmsg: res.data.errmsg });
+        return null;
+      }
+
+      const customer = res.data.customer_list?.[0];
+      if (!customer) {
+        logger.warn('Customer not found in response', { externalUserId });
+        return null;
+      }
+
+      logger.info('Customer info retrieved', { externalUserId, nickname: customer.nickname });
+      return {
+        nickname: customer.nickname,
+        avatar: customer.avatar,
+        gender: customer.gender
+      };
+    } catch (err) {
+      logger.error('Failed to get customer info', { error: err.message });
+      return null;
+    }
+  }
+
   async uploadMedia(mediaUrl, type = 'image') {
     const token = await this.getAccessToken();
     const FormData = require('form-data');
